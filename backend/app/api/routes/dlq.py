@@ -1,4 +1,5 @@
 """DLQ HTTP surface — the operator's 3am entry point. See DESIGN.md section 5."""
+
 from __future__ import annotations
 
 import uuid

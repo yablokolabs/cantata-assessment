@@ -6,6 +6,7 @@ success and `dramatiq:default.XQ` is never even created. See DESIGN.md section 1
 
 See DESIGN.md section 4 for the replay guarantees enforced below.
 """
+
 from __future__ import annotations
 
 import uuid

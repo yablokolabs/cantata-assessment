@@ -6,6 +6,7 @@ land in one transaction. This is the atomicity architecture.md claims for the
 `after_nack` middleware but cannot deliver, because that path spans Redis and
 Postgres. See DESIGN.md section 2.
 """
+
 from __future__ import annotations
 
 import uuid

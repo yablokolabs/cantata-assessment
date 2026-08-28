@@ -7,6 +7,7 @@ means guessing from a traceback string. See DESIGN.md section 3.
 The taxonomy below is not invented: the steps already define distinct exception
 types for exactly these cases, and nothing was ever wired up to read them.
 """
+
 from __future__ import annotations
 
 import httpx
