@@ -19,9 +19,16 @@ dramatiq.set_broker(RedisBroker(url=settings.redis_url))
 def run_step(pipeline_id: str, step_tag_value: str) -> None:
     """Dramatiq actor that runs a single pipeline step.
 
-    max_retries=0 — failures land in Redis XQ immediately. There is no DLQ persistence layer:
-    failed messages are visible via DLQGauge metrics but the message itself expires from XQ
-    after Dramatiq's default TTL.
+    Step-level failures are captured by the orchestrator into the
+    `dead_letter_message` table, in the same transaction as the pipeline's
+    CRASHED status. Exceptions do not escape to dramatiq — `run_step_inline`
+    catches them — so broker retries and Redis XQ dead-lettering never occur,
+    and `dramatiq:default.XQ` is never written.
+
+    max_retries=0 is a pre-existing deviation from AGENTS.md §Retry Policy,
+    left in place deliberately: restoring automatic retries before the
+    side-effecting steps are idempotent would duplicate vendor jobs, invite
+    emails and customer deliveries. See DESIGN.md section 6b.
     """
     from app.pipeline.orchestrator import run_step_inline
 
