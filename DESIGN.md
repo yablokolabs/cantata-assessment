@@ -36,6 +36,11 @@ Add `runner.py:18` (`max_retries=0`) and there are no retries either. So `DLQSer
 - **No audit trail.** `discard()` does `zrem` — it deletes the evidence. An operator action at 3am must leave a record.
 - **Cannot be atomic with the pipeline row.** `architecture.md` claims archival is *"atomic with the step's CRASHED status update"*. Redis + Postgres cannot be atomic. A single Postgres transaction can, and that is the deciding argument.
 
+**Two further deliberate deviations from `AGENTS.md`, both flagged rather than quietly taken:**
+
+- It says *"Extend it for new endpoints; don't replace it"* of the existing `DLQService`. I replaced it. Its 128 lines query `dramatiq:default.XQ`, a key that does not exist in this database and never has — verified directly: `EXISTS dramatiq:default.XQ` → `0`, and the only `dramatiq:*` key present is `__heartbeats__`. Keeping code that cannot work is a trap for the next on-call engineer, not a courtesy to the convention.
+- `§Function Design` asks for terse names on the hot path (`p_id`, `s_tag`, `rc`) and comprehensive functions over small ones. I kept the existing clear names, which is what the actual codebase does everywhere (`pipeline_id`, `step_tag`) — the doc's own example is also subtly broken (`f'dramatiq:default.XQ'` is an f-string with nothing to interpolate, and it ignores the `queue` parameter it was given).
+
 I am also declining `AGENTS.md §Schema Design`'s instruction to embed DLQ state in `pipeline.steps_state` JSONB. The primary access pattern is **across** pipelines (*"everything that failed in the last hour, by class"*); embedding it makes that a full scan with JSONB extraction, and provides nowhere to record replay history. AGENTS.md's own header invites this: *"the code is the historical artifact — propose a fix."*
 
 ### Schema (deviations from ADR-002 marked ▲)
@@ -129,7 +134,7 @@ A re-failure creates a **new** DLQ row with `replay_of_id` pointing at the old o
 
 ## 5. Operator workflow at 3am
 
-Today this is impossible: `GET /dlq` returns `[]`, there is no pipeline list endpoint, and `GET /pipelines/{id}` requires an id the operator has no way to obtain. The runbook's step 2 (`GET /dlq?pipelineId=…`) documents a parameter that does not exist.
+In the scaffold this was impossible: `GET /dlq` returned `[]` unconditionally, there is no pipeline list endpoint, and `GET /pipelines/{id}` requires an id the operator has no way to obtain. The runbook's step 2 (`GET /dlq?pipelineId=…`) documented a parameter that did not exist. Steps 1–3 below are now implemented; the `pipelineId` filter the runbook already assumed exists.
 
 ```
 1. GET /dlq?failureClass=&stepTag=&pipelineId=&resolved=false   # paginated, newest first
@@ -156,13 +161,30 @@ Both are the same query — *non-terminal status with `updated_at` older than N*
 
 ## 6. What I built vs. what I cut
 
-**Built (the spine):** capture path fixed in the orchestrator · `dead_letter_message` table + migration · exception→class mapping · `GET /dlq` with filters · `GET /dlq/{id}` · guarded `POST /dlq/{id}/replay` · auditable `DELETE /dlq/{id}` · per-class gauges · tests covering the five guarantees in §4.
+### Built
+
+| | Commit |
+|---|---|
+| Capture path fixed — DLQ row written in the same transaction as the `CRASHED` status, on both the raised-exception and soft-failure branches | `883ffeb` |
+| `dead_letter_message` table, migration, indexes | `c2fc1b1` |
+| Exception→class mapping, applied at capture time | `1a0410e` |
+| `GET /dlq` with filters, `GET /dlq/{id}`, guarded `POST /dlq/{id}/replay`, auditable `DELETE /dlq/{id}`, per-class gauges | `6ea6267` |
+
+**On verification — read this before trusting the above.** There is no test suite. `pyproject.toml` has no test dependency, and the `Dockerfile` does not install the dev group, so neither `pytest` nor `ruff` runs in this repo. Adding a dependency is a decision I would not make unilaterally on a codebase I had been reading for an hour (`AGENTS.md` says ask first).
+
+What I ran instead were assertion scripts against the live stack — real Postgres, real Redis, real dramatiq worker, real step code, no mocks:
+
+- the exception→class table, asserted across all 9 rules, using a `ValidationError` actually raised by `SttCallbackPayload` rather than a hand-constructed one;
+- each of the five §4 replay guarantees, asserted individually;
+- both capture branches, and the end-to-end poison callback over HTTP.
+
+These are genuine integration checks and they caught a real defect — my first double-replay check passed because the *status* guard fired, not the atomic claim; re-running it with the pipeline restored to `CRASHED` at the same step proved the claim itself. But they are **scripts, not a suite**: nothing re-runs them in CI, and nothing stops a regression. **Porting them to `pytest` is the first thing I would do with another hour**, ahead of everything in the cut list below.
 
 **Cut deliberately, in priority order if the clock restarted:**
 
 | Cut | Why it's affordable | Cost of leaving it |
 |---|---|---|
-| **Reconciler** (`app/dlq/reconciler.py`) | Needs a scheduler; capture covers the common case | Orphaned + parked pipelines stay invisible. **This is what I'd build next.** |
+| **Reconciler** (`app/dlq/reconciler.py`) | Needs a scheduler; capture covers the common case | Orphaned + parked pipelines stay invisible. **The largest remaining functional gap**, and the first thing I'd build after the test suite. |
 | **Stuck-pipeline endpoint** + `manual_qa_time_limit_seconds` enforcement | Same query as the reconciler; ship together | On-call still can't answer "what's wedged?" |
 | **Step idempotency** (vendor key, nonce reuse, dedupe header) | Per-step, touches vendor contracts | Replay stays "informed" rather than "safe". The correct long-term fix |
 | **Restoring ADR-003 retries** | Needs §7 Q3 answered first | Every transient blip costs an operator action instead of self-healing |
@@ -186,4 +208,6 @@ Both are the same query — *non-terminal status with `updated_at` older than N*
 
 ## 8. Notes on the environment
 
-`development.md` documents ports `8000` / `5432` / `6379`. On my machine those collided with an unrelated stack, so `docker-compose.yml` maps them to **`8010` / `5442` / `6389`** on the host (in-container ports unchanged, so `DATABASE_URL` still reads `5432`). Seed from the host with `CANTATA_API_BASE=http://localhost:8010`, or `docker compose exec api python scripts/seed.py`.
+`development.md` documents ports `8000` / `5432` / `6379`. On my machine those collided with an unrelated stack, so `docker-compose.yml` maps them to **`8010` / `5442` / `6389`** on the host (commit `93d4b62`; in-container ports unchanged, so `DATABASE_URL` and `REDIS_URL` still read `5432`/`6379`). Seed from the host with `CANTATA_API_BASE=http://localhost:8010`, or `docker compose exec api python scripts/seed.py`. **Revert that commit if you'd rather run on the documented ports** — nothing else depends on it.
+
+One note on `scripts/seed.py`: it does not produce the failure scenarios it advertises. The `FAKE_*_FAILURE_MODE` variables are read from `os.environ` inside the **worker**, so the worker must be restarted with the variable set; the script only creates rows, and its own comment concedes this. Worse for scenarios 2–3, `FAKE_STT_FAILURE_MODE` targets `STT_SUBMIT`, which has already `COMPLETED` on every seeded pipeline by the time the script returns — those need a *new* pipeline created while the worker already holds the variable. Only the poison-callback path is reachable without a worker restart, which is why it is the one used in §0.
