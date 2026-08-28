@@ -11,10 +11,16 @@ docker compose up
 
 Services come up on:
 
-- **Backend API:** <http://localhost:8000>
-- **Swagger UI:** <http://localhost:8000/docs>
-- **Postgres:** `localhost:5432` (db: `cantata`, user: `cantata`, password: `cantata`)
-- **Redis:** `localhost:6379`
+- **Backend API:** <http://localhost:8010>
+- **Swagger UI:** <http://localhost:8010/docs>
+- **Postgres:** `localhost:5442` (db: `cantata`, user: `cantata`, password: `cantata`)
+- **Redis:** `localhost:6389`
+
+> Host ports were changed from the original 8000/5432/6379 in commit `93d4b62`,
+> which collided with another stack on the development machine. In-container
+> ports are unchanged, so `DATABASE_URL` and `REDIS_URL` inside the compose
+> network still read 5432/6379. Revert that single commit to restore the
+> original host ports; nothing else depends on it.
 
 The `api` and `worker` services share the same image. The `worker` runs the dramatiq broker against Redis.
 
@@ -39,8 +45,19 @@ uv run alembic revision --autogenerate -m "your description"
 To populate the database with five in-flight pipelines:
 
 ```bash
-uv run python scripts/seed.py
+CANTATA_API_BASE=http://localhost:8010 uv run python scripts/seed.py
 ```
+
+Or from inside the container, where the default base URL is already correct:
+
+```bash
+docker compose exec api python scripts/seed.py
+```
+
+Note that this script only creates pipeline rows. The `FAKE_*_FAILURE_MODE`
+variables its scenarios reference are read from `os.environ` inside the
+**worker**, so the worker must be restarted with the variable set before a
+scenario will actually trigger.
 
 ## Tooling
 
