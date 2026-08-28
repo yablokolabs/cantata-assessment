@@ -6,7 +6,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.dlq.capture import SOFT_FAILURE, record_failure
+from app.dlq.capture import record_failure
 from app.models import (
     PIPELINE_STEP_ORDER,
     Pipeline,
@@ -121,7 +121,7 @@ def run_step_inline(session: Session, pipeline_id: str, step_tag: StepTag) -> No
             session,
             pipeline,
             step_tag,
-            exception_type=type(exc).__name__,
+            exc=exc,
             traceback_text=traceback.format_exc(),
         )
         session.commit()
@@ -148,7 +148,6 @@ def run_step_inline(session: Session, pipeline_id: str, step_tag: StepTag) -> No
             session,
             pipeline,
             step_tag,
-            exception_type=SOFT_FAILURE,
             traceback_text=result.error_message,
         )
         session.commit()

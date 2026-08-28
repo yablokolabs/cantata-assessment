@@ -12,7 +12,8 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from app.models import DeadLetterMessage, FailureClass, Pipeline, StepTag
+from app.dlq.classify import SOFT_FAILURE_CLASS, classify
+from app.models import DeadLetterMessage, Pipeline, StepTag
 from app.observability.logging import logger
 
 SOFT_FAILURE = 'StepSoftFailure'
@@ -23,15 +24,19 @@ def record_failure(
     pipeline: Pipeline,
     step_tag: StepTag,
     *,
-    exception_type: str,
-    traceback_text: str | None,
-    failure_class: FailureClass = FailureClass.UNKNOWN,
+    exc: BaseException | None = None,
+    traceback_text: str | None = None,
 ) -> DeadLetterMessage:
     """Add a dead-letter row to the session without committing.
 
-    exception_type: the exception class name, or SOFT_FAILURE for a step that
-                    returned success=False rather than raising.
+    exc: the raised exception, or None for a step that returned success=False
+         rather than raising. Drives the failure class.
+    traceback_text: formatted traceback, or the step's error message on a soft
+         failure.
     """
+    failure_class = classify(exc) if exc is not None else SOFT_FAILURE_CLASS
+    exception_type = type(exc).__name__ if exc is not None else SOFT_FAILURE
+
     row = DeadLetterMessage(
         id=uuid.uuid4(),
         pipeline_id=pipeline.id,
