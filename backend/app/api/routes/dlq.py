@@ -44,9 +44,9 @@ def list_dlq(
 ) -> dict[str, Any]:
     rows = _service.list(
         session,
-        failure_class=failure_class,
-        step_tag=step_tag,
-        pipeline_id=pipeline_id,
+        f_class=failure_class,
+        s_tag=step_tag,
+        p_id=pipeline_id,
         resolved=resolved,
         limit=limit,
         offset=offset,

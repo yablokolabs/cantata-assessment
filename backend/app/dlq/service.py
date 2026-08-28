@@ -40,26 +40,31 @@ class DLQService:
         self,
         session: Session,
         *,
-        failure_class: str | None = None,
-        step_tag: str | None = None,
-        pipeline_id: uuid.UUID | None = None,
+        f_class: str | None = None,
+        s_tag: str | None = None,
+        p_id: uuid.UUID | None = None,
         resolved: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> list[DeadLetterMessage]:
-        """Newest first. resolved=False returns only rows still needing action."""
+        """Newest first. resolved=False returns only rows still needing action.
+
+        f_class: failure class filter
+        s_tag: step tag filter
+        p_id: pipeline id filter
+        """
         stmt = select(DeadLetterMessage)
         if not resolved:
             stmt = stmt.where(
                 DeadLetterMessage.replayed_at.is_(None),
                 DeadLetterMessage.discarded_at.is_(None),
             )
-        if failure_class is not None:
-            stmt = stmt.where(DeadLetterMessage.failure_class == failure_class)
-        if step_tag is not None:
-            stmt = stmt.where(DeadLetterMessage.step_tag == step_tag)
-        if pipeline_id is not None:
-            stmt = stmt.where(DeadLetterMessage.pipeline_id == pipeline_id)
+        if f_class is not None:
+            stmt = stmt.where(DeadLetterMessage.failure_class == f_class)
+        if s_tag is not None:
+            stmt = stmt.where(DeadLetterMessage.step_tag == s_tag)
+        if p_id is not None:
+            stmt = stmt.where(DeadLetterMessage.pipeline_id == p_id)
         stmt = stmt.order_by(DeadLetterMessage.created_at.desc()).limit(limit).offset(offset)
         return list(session.execute(stmt).scalars())
 
@@ -153,7 +158,7 @@ class DLQService:
         # Guarantee 5 — dispatch only after the commit. If this throws we have an
         # ENQUEUED pipeline with a replayed row, which the reconciler picks up.
         # Enqueuing before the commit would not be recoverable.
-        dispatch_step(str(pipeline.id), step_tag)
+        dispatch_step(str(pipeline.id), step_tag, rc=row.attempts)
 
         logger.info(
             'dlq_replayed',
@@ -168,6 +173,7 @@ class DLQService:
             'pipeline_id': str(pipeline.id),
             'step_tag': step_tag.value,
             'failure_class': failure_class.value,
+            'retry_count': row.attempts,
             'forced': force,
         }
 

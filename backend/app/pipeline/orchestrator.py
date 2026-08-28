@@ -122,7 +122,7 @@ def run_step_inline(session: Session, pipeline_id: str, step_tag: StepTag) -> No
             pipeline,
             step_tag,
             exc=exc,
-            traceback_text=traceback.format_exc(),
+            tb=traceback.format_exc(),
         )
         session.commit()
         return
@@ -148,7 +148,7 @@ def run_step_inline(session: Session, pipeline_id: str, step_tag: StepTag) -> No
             session,
             pipeline,
             step_tag,
-            traceback_text=result.error_message,
+            tb=result.error_message,
         )
         session.commit()
         return

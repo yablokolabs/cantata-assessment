@@ -32,6 +32,11 @@ def run_step(pipeline_id: str, step_tag_value: str) -> None:
         session.close()
 
 
-def dispatch_step(pipeline_id: str, step_tag: StepTag) -> None:
-    logger.info('dispatch_step', pipeline_id=pipeline_id, step_tag=step_tag.value)
-    run_step.send(pipeline_id, step_tag.value)
+def dispatch_step(p_id: str, s_tag: StepTag, rc: int = 0) -> None:
+    """
+    p_id: pipeline id
+    s_tag: step tag
+    rc: retry count, carried as a message header on replay
+    """
+    logger.info('dispatch_step', pipeline_id=p_id, step_tag=s_tag.value, retry_count=rc)
+    run_step.send_with_options(args=(p_id, s_tag.value), retry_count=rc)
