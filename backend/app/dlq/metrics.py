@@ -1,30 +1,16 @@
-"""DLQ gauge metrics.
+"""DLQ gauge metrics — unresolved dead-letter rows, per failure class.
 
-Reads the size of dramatiq's Redis XQ sorted sets per queue. This is the only
-piece of the "DLQ" that actually works today.
+Previously read `dramatiq:default.XQ` in Redis, a key that is never written
+because the orchestrator swallows step exceptions before dramatiq can nack.
 """
 from __future__ import annotations
 
-import redis
+from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.dlq.service import DLQService
 
-_redis: redis.Redis | None = None
-
-
-def _client() -> redis.Redis:
-    global _redis
-    if _redis is None:
-        _redis = redis.Redis.from_url(settings.redis_url, decode_responses=True)
-    return _redis
+_service = DLQService()
 
 
-def current_gauges() -> dict[str, int]:
-    """Return {queue_name: xq_size} for every dramatiq queue we know about."""
-    try:
-        client = _client()
-        return {
-            'default': int(client.zcard('dramatiq:default.XQ') or 0),
-        }
-    except redis.RedisError:
-        return {'default': 0}
+def current_gauges(session: Session) -> dict[str, int]:
+    return _service.gauges(session)

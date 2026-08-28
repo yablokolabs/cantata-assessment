@@ -58,7 +58,7 @@ def _next_step(pipeline: Pipeline, current: StepTag) -> StepTag | None:
     return PIPELINE_STEP_ORDER[idx + 1]
 
 
-def _set_step_state(pipeline: Pipeline, step_tag: StepTag, **fields: Any) -> None:
+def set_step_state(pipeline: Pipeline, step_tag: StepTag, **fields: Any) -> None:
     state = dict(pipeline.steps_state)
     state[step_tag.value] = {**state.get(step_tag.value, {}), **fields}
     pipeline.steps_state = state
@@ -71,7 +71,7 @@ def begin_pipeline(session: Session, pipeline: Pipeline) -> None:
     first = PIPELINE_STEP_ORDER[0]
     pipeline.status = PipelineStatus.RUNNING.value
     pipeline.current_step = first.value
-    _set_step_state(pipeline, first, status=StepStatus.ENQUEUED.value)
+    set_step_state(pipeline, first, status=StepStatus.ENQUEUED.value)
     session.commit()
     dispatch_step(str(pipeline.id), first)
 
@@ -98,7 +98,7 @@ def run_step_inline(session: Session, pipeline_id: str, step_tag: StepTag) -> No
     step = step_cls()
 
     # Phase 1a: mark PROCESSING and commit.
-    _set_step_state(pipeline, step_tag, status=StepStatus.PROCESSING.value)
+    set_step_state(pipeline, step_tag, status=StepStatus.PROCESSING.value)
     session.commit()
 
     argument = _build_argument(pipeline, step_tag)
@@ -108,7 +108,7 @@ def run_step_inline(session: Session, pipeline_id: str, step_tag: StepTag) -> No
     except Exception as exc:  # noqa: BLE001
         # Step raised. Mark CRASHED, persist exception, halt pipeline.
         logger.error('step_crashed', pipeline_id=pipeline_id, step_tag=step_tag.value, error=str(exc))
-        _set_step_state(
+        set_step_state(
             pipeline,
             step_tag,
             status=StepStatus.CRASHED.value,
@@ -135,7 +135,7 @@ def run_step_inline(session: Session, pipeline_id: str, step_tag: StepTag) -> No
             step_tag=step_tag.value,
             error=result.error_message,
         )
-        _set_step_state(
+        set_step_state(
             pipeline,
             step_tag,
             status=StepStatus.CRASHED.value,
@@ -157,7 +157,7 @@ def run_step_inline(session: Session, pipeline_id: str, step_tag: StepTag) -> No
     stores = dict(pipeline.stores_state)
     stores.update(result.updates_to_stores)
     pipeline.stores_state = stores
-    _set_step_state(pipeline, step_tag, status=StepStatus.COMPLETED.value)
+    set_step_state(pipeline, step_tag, status=StepStatus.COMPLETED.value)
 
     next_tag = _next_step(pipeline, step_tag)
     if next_tag is None:
@@ -173,13 +173,13 @@ def run_step_inline(session: Session, pipeline_id: str, step_tag: StepTag) -> No
 
     if next_step.is_triggered_outside:
         # Wait for an external callback before advancing.
-        _set_step_state(pipeline, next_tag, status=StepStatus.WAITING.value)
+        set_step_state(pipeline, next_tag, status=StepStatus.WAITING.value)
         pipeline.status = PipelineStatus.WAITING.value
         session.commit()
         logger.info('pipeline_waiting_external', pipeline_id=pipeline_id, step_tag=next_tag.value)
         return
 
-    _set_step_state(pipeline, next_tag, status=StepStatus.ENQUEUED.value)
+    set_step_state(pipeline, next_tag, status=StepStatus.ENQUEUED.value)
     session.commit()
     # Phase 2: dispatch next step. NOT retried on dispatch failure.
     dispatch_step(pipeline_id, next_tag)
@@ -196,7 +196,7 @@ def resume_after_external_callback(session: Session, pipeline_id: str) -> None:
     if pipeline.current_step is None:
         return
     tag = StepTag(pipeline.current_step)
-    _set_step_state(pipeline, tag, status=StepStatus.ENQUEUED.value)
+    set_step_state(pipeline, tag, status=StepStatus.ENQUEUED.value)
     pipeline.status = PipelineStatus.RUNNING.value
     session.commit()
     dispatch_step(pipeline_id, tag)

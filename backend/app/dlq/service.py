@@ -1,128 +1,187 @@
-"""DLQService — operator-facing dead-letter queue.
+"""DLQService — operator-facing dead-letter queue over the dead_letter_message table.
 
-Reads dead-lettered messages from Dramatiq's Redis XQ and supports replay by
-re-enqueueing onto the same queue with an incremented `retry_count` header.
+Replaces the previous Redis XQ implementation. That version could not work: the
+orchestrator swallows every step exception, so dramatiq acks each message as a
+success and `dramatiq:default.XQ` is never even created. See DESIGN.md section 1.
 
-See AGENTS.md § Dead-Letter Queue and ADR-002 for the design rationale.
+See DESIGN.md section 4 for the replay guarantees enforced below.
 """
 from __future__ import annotations
 
-import json
 import uuid
 from typing import Any
 
-import dramatiq
-import redis
+from sqlalchemy import func, select, update
+from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.models import (
+    DeadLetterMessage,
+    FailureClass,
+    Pipeline,
+    PipelineStatus,
+    StepStatus,
+    StepTag,
+)
 from app.observability.logging import logger
 
-_DLQ_KEY_TEMPLATE = 'dramatiq:{queue}.XQ'
+# POISON and NEEDS_HUMAN never replay: one reproduces the identical failure, the
+# other needs a person to act first. UNKNOWN means we do not know whether the
+# side effect landed, so it replays only on an explicit operator override.
+NEVER_REPLAY = frozenset({FailureClass.POISON, FailureClass.NEEDS_HUMAN})
+FORCE_REQUIRED = frozenset({FailureClass.UNKNOWN})
+
+
+class ReplayRefused(Exception):
+    """Replay is not permitted for this row in its current state."""
 
 
 class DLQService:
-    def __init__(self, queue: str = 'default') -> None:
-        self.queue = queue
-        self._redis: redis.Redis | None = None
+    def list(
+        self,
+        session: Session,
+        *,
+        failure_class: str | None = None,
+        step_tag: str | None = None,
+        pipeline_id: uuid.UUID | None = None,
+        resolved: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[DeadLetterMessage]:
+        """Newest first. resolved=False returns only rows still needing action."""
+        stmt = select(DeadLetterMessage)
+        if not resolved:
+            stmt = stmt.where(
+                DeadLetterMessage.replayed_at.is_(None),
+                DeadLetterMessage.discarded_at.is_(None),
+            )
+        if failure_class is not None:
+            stmt = stmt.where(DeadLetterMessage.failure_class == failure_class)
+        if step_tag is not None:
+            stmt = stmt.where(DeadLetterMessage.step_tag == step_tag)
+        if pipeline_id is not None:
+            stmt = stmt.where(DeadLetterMessage.pipeline_id == pipeline_id)
+        stmt = stmt.order_by(DeadLetterMessage.created_at.desc()).limit(limit).offset(offset)
+        return list(session.execute(stmt).scalars())
 
-    def _client(self) -> redis.Redis:
-        if self._redis is None:
-            self._redis = redis.Redis.from_url(settings.redis_url, decode_responses=True)
-        return self._redis
+    def get(self, session: Session, dlq_id: uuid.UUID) -> DeadLetterMessage | None:
+        return session.get(DeadLetterMessage, dlq_id)
 
-    def list_all(self, *, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
-        """Return dead-lettered messages from the XQ sorted set.
+    def gauges(self, session: Session) -> dict[str, int]:
+        """Unresolved row counts per failure class.
 
-        Each entry includes the original dramatiq message body plus the
-        archived-at timestamp (the XQ sorted-set score is the nack timestamp).
+        Per class, not a single total: 40 POISON is a bug shipped an hour ago,
+        40 TRANSIENT is a vendor outage. Same number, opposite response.
         """
-        key = _DLQ_KEY_TEMPLATE.format(queue=self.queue)
-        client = self._client()
-        raw = client.zrange(key, offset, offset + limit - 1, withscores=True)
-        out: list[dict[str, Any]] = []
-        for raw_msg, score in raw:
-            try:
-                body = json.loads(raw_msg)
-            except json.JSONDecodeError:
-                continue
-            out.append(
-                {
-                    'message_id': body.get('message_id'),
-                    'actor_name': body.get('actor_name'),
-                    'args': body.get('args', []),
-                    'kwargs': body.get('kwargs', {}),
-                    'options': body.get('options', {}),
-                    'archived_at': float(score),
-                }
+        stmt = (
+            select(DeadLetterMessage.failure_class, func.count())
+            .where(
+                DeadLetterMessage.replayed_at.is_(None),
+                DeadLetterMessage.discarded_at.is_(None),
             )
-        return out
+            .group_by(DeadLetterMessage.failure_class)
+        )
+        counts = {c.value: 0 for c in FailureClass}
+        for failure_class, count in session.execute(stmt):
+            counts[failure_class] = count
+        return counts
 
-    def get(self, message_id: str) -> dict[str, Any] | None:
-        for entry in self.list_all(limit=1000):
-            if entry.get('message_id') == message_id:
-                return entry
-        return None
+    def replay(self, session: Session, dlq_id: uuid.UUID, *, force: bool = False) -> dict[str, Any]:
+        """Re-dispatch the failed step, enforcing the DESIGN.md section 4 guarantees."""
+        from app.pipeline.orchestrator import set_step_state
+        from app.pipeline.runner import dispatch_step
 
-    def replay(self, message_id: str) -> dict[str, Any]:
-        """Re-enqueue a dead-lettered message.
+        row = session.get(DeadLetterMessage, dlq_id)
+        if row is None:
+            raise LookupError(f'dlq entry {dlq_id} not found')
 
-        Looks up the message in XQ by message_id, increments the `retry_count`
-        header in the message options, removes the XQ entry, and re-enqueues
-        to the same actor on the same queue.
-        """
-        key = _DLQ_KEY_TEMPLATE.format(queue=self.queue)
-        client = self._client()
-        raw_entries = client.zrange(key, 0, -1)
-        for raw_msg in raw_entries:
-            try:
-                body = json.loads(raw_msg)
-            except json.JSONDecodeError:
-                continue
-            if body.get('message_id') != message_id:
-                continue
-
-            options = dict(body.get('options', {}))
-            retry_count = int(options.get('retry_count', 0)) + 1
-            options['retry_count'] = retry_count
-
-            broker = dramatiq.get_broker()
-            actor = broker.get_actor(body['actor_name'])
-            new_message = actor.message_with_options(
-                args=tuple(body.get('args', [])),
-                kwargs=dict(body.get('kwargs', {})),
-                **options,
+        # Guarantee 1 — class gate.
+        failure_class = FailureClass(row.failure_class)
+        if failure_class in NEVER_REPLAY:
+            raise ReplayRefused(
+                f'{failure_class.value} is not replayable: '
+                f'{"a replay reproduces the identical failure" if failure_class is FailureClass.POISON else "a person must act first"}. '
+                f'Discard it instead.'
             )
-            broker.enqueue(new_message)
-
-            client.zrem(key, raw_msg)
-            logger.info(
-                'dlq_replayed',
-                message_id=message_id,
-                actor=body['actor_name'],
-                retry_count=retry_count,
+        if failure_class in FORCE_REQUIRED and not force:
+            raise ReplayRefused(
+                f'{failure_class.value} may have already applied its side effect '
+                f'({row.exception_type}). Replaying could duplicate it. '
+                f'Re-send with force=true to override.'
             )
-            return {
-                'message_id': new_message.message_id,
-                'original_message_id': message_id,
-                'retry_count': retry_count,
-            }
 
-        raise LookupError(f'dlq entry not found for message_id={message_id}')
+        # Guarantee 3 — the pipeline is still in the state this row describes.
+        pipeline = session.get(Pipeline, row.pipeline_id)
+        if pipeline is None:
+            raise ReplayRefused(f'pipeline {row.pipeline_id} no longer exists')
+        if pipeline.status != PipelineStatus.CRASHED.value:
+            raise ReplayRefused(
+                f'pipeline is {pipeline.status}, not CRASHED — it has already moved on. '
+                f'Replaying now would re-run a step out of order.'
+            )
+        if pipeline.current_step != row.step_tag:
+            raise ReplayRefused(
+                f'pipeline is at {pipeline.current_step}, but this row is for '
+                f'{row.step_tag}. Replaying a stale step risks duplicate side effects.'
+            )
 
-    def discard(self, message_id: str) -> bool:
-        key = _DLQ_KEY_TEMPLATE.format(queue=self.queue)
-        client = self._client()
-        for raw_msg in client.zrange(key, 0, -1):
-            try:
-                body = json.loads(raw_msg)
-            except json.JSONDecodeError:
-                continue
-            if body.get('message_id') == message_id:
-                client.zrem(key, raw_msg)
-                logger.info('dlq_discarded', message_id=message_id)
-                return True
-        return False
+        # Guarantee 2 — claim the row atomically. Two operators hitting replay at
+        # the same time: exactly one UPDATE matches, the other gets zero rows.
+        claimed = session.execute(
+            update(DeadLetterMessage)
+            .where(
+                DeadLetterMessage.id == dlq_id,
+                DeadLetterMessage.replayed_at.is_(None),
+                DeadLetterMessage.discarded_at.is_(None),
+            )
+            .values(replayed_at=func.now())
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        if claimed != 1:
+            session.rollback()
+            raise ReplayRefused('already replayed or discarded by another operator')
 
+        # Guarantee 4 — reset pipeline state in the same transaction as the claim.
+        # Otherwise the pipeline reads CRASHED while a worker is actively running
+        # it, and every "is it stuck?" query gets the wrong answer.
+        step_tag = StepTag(row.step_tag)
+        set_step_state(pipeline, step_tag, status=StepStatus.ENQUEUED.value, exception=None)
+        pipeline.status = PipelineStatus.RUNNING.value
+        pipeline.exception = None
+        pipeline.is_pipeline_level_crash = False
+        session.commit()
 
-def _new_id() -> str:
-    return str(uuid.uuid4())
+        # Guarantee 5 — dispatch only after the commit. If this throws we have an
+        # ENQUEUED pipeline with a replayed row, which the reconciler picks up.
+        # Enqueuing before the commit would not be recoverable.
+        dispatch_step(str(pipeline.id), step_tag)
+
+        logger.info(
+            'dlq_replayed',
+            dlq_id=str(dlq_id),
+            pipeline_id=str(pipeline.id),
+            step_tag=step_tag.value,
+            failure_class=failure_class.value,
+            forced=force,
+        )
+        return {
+            'id': str(dlq_id),
+            'pipeline_id': str(pipeline.id),
+            'step_tag': step_tag.value,
+            'failure_class': failure_class.value,
+            'forced': force,
+        }
+
+    def discard(self, session: Session, dlq_id: uuid.UUID, *, reason: str) -> DeadLetterMessage:
+        """Soft delete. The row stays queryable — operator actions leave a record."""
+        row = session.get(DeadLetterMessage, dlq_id)
+        if row is None:
+            raise LookupError(f'dlq entry {dlq_id} not found')
+        if row.discarded_at is not None:
+            raise ReplayRefused('already discarded')
+        if row.replayed_at is not None:
+            raise ReplayRefused('already replayed; discard the row its replay produced')
+        row.discarded_at = func.now()
+        row.discard_reason = reason
+        session.commit()
+        logger.info('dlq_discarded', dlq_id=str(dlq_id), reason=reason)
+        return row
