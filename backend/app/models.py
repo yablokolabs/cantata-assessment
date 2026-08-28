@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -67,3 +67,38 @@ class Pipeline(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class FailureClass(str, enum.Enum):
+    TRANSIENT = 'TRANSIENT'
+    POISON = 'POISON'
+    NEEDS_HUMAN = 'NEEDS_HUMAN'
+    UNKNOWN = 'UNKNOWN'
+
+
+class DeadLetterMessage(Base):
+    __tablename__ = 'dead_letter_message'
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pipeline_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey('pipeline.id'), nullable=False, index=True
+    )
+    step_tag: Mapped[str] = mapped_column(String, nullable=False)
+    failure_class: Mapped[str] = mapped_column(String, nullable=False)
+    exception_type: Mapped[str] = mapped_column(String, nullable=False)
+    traceback: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Actor args needed to re-dispatch. Deliberately does not copy stores_state:
+    # transcript text is customer PII and already lives on the linked pipeline row.
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    replayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    replay_of_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey('dead_letter_message.id'), nullable=True
+    )
+    discarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    discard_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
